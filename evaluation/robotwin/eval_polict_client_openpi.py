@@ -6,7 +6,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-robowin_root = Path("/path/to/your/robowin")
+robowin_root = Path("/mnt/data/qianbin/RoboTwin")
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 
@@ -399,6 +399,7 @@ def main(usr_args):
     
     model = WebsocketClientPolicy(port=usr_args['port'])
 
+    save_vis = usr_args.get("save_visualization", False)
     st_seed, suc_num = eval_policy(task_name,
                                    TASK_ENV,
                                    args,
@@ -407,7 +408,7 @@ def main(usr_args):
                                    test_num=test_num,
                                    video_size=video_size,
                                    instruction_type=instruction_type,
-                                   save_visualization=True,
+                                   save_visualization=save_vis,
                                    video_guidance_scale=video_guidance_scale,
                                    action_guidance_scale=action_guidance_scale)
     suc_nums.append(suc_num)
@@ -612,17 +613,18 @@ def eval_policy(task_name,
                 break
       
 
-        vis_dir = Path(args['save_root']) / f'stseed-{st_seed}' / 'visualization' / task_name
-        vis_dir.mkdir(parents=True, exist_ok=True)
-        video_name = f"{TASK_ENV.test_num}_{prompt.replace(' ', '_')}_{succ}.mp4"
-        out_img_file = vis_dir / video_name
-        save_comparison_video(
-            real_obs_list=full_obs_list,
-            imagined_video=None, #gen_video_list,
-            action_history=full_action_history,
-            save_path=str(out_img_file),
-            fps=15 # Suggest adjusting fps based on simulation step
-        )
+        if save_visualization:
+            vis_dir = Path(args['save_root']) / f'stseed-{st_seed}' / 'visualization' / task_name
+            vis_dir.mkdir(parents=True, exist_ok=True)
+            video_name = f"{TASK_ENV.test_num}_{prompt.replace(' ', '_')}_{succ}.mp4"
+            out_img_file = vis_dir / video_name
+            save_comparison_video(
+                real_obs_list=full_obs_list,
+                imagined_video=None, #gen_video_list,
+                action_history=full_action_history,
+                save_path=str(out_img_file),
+                fps=15
+            )
         if TASK_ENV.eval_video_path is not None:
             TASK_ENV._del_eval_video_ffmpeg()
 
@@ -667,6 +669,7 @@ def parse_args_and_config():
     parser.add_argument("--video_guidance_scale", type=float, default=5.0)
     parser.add_argument("--action_guidance_scale", type=float, default=5.0)
     parser.add_argument("--test_num", type=int, default=100)
+    parser.add_argument("--save_visualization", action="store_true", default=False)
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:

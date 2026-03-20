@@ -1,4 +1,5 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+# Modified from train.py: adds VGGT geometric alignment loss for world model.
 import argparse
 import os
 import sys
@@ -9,7 +10,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
@@ -33,6 +33,7 @@ from distributed.util import (
 from einops import rearrange
 from modules.utils import (
     load_transformer,
+    load_vae,
 )
 from utils import (
     init_logger, 
@@ -45,26 +46,28 @@ from utils import (
 )
 
 from dataset import MultiLatentLeRobotDataset
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
 import gc
 
 
-class Trainer:
+class VGGTTrainer:
     def __init__(self, config):
         if config.enable_wandb and config.rank == 0:
             wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
             self.wandb = wandb
             self.wandb.init(
                 entity=os.environ["WANDB_TEAM_NAME"],
-                project=os.getenv("WANDB_PROJECT", "va_robotwin"),
-                # dir=log_dir,
+                project=os.getenv("WANDB_PROJECT", "va_robotwin_vggt"),
                 config=config,
                 mode="online",
-                name='test_lln'
-                # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
+                name='train_vggt'
             )
             logger.info("WandB logging enabled")
         self.tb_writer = None
-        if config.rank == 0:
+        if config.rank == 0 and SummaryWriter is not None:
             tb_log_dir = str(Path(config.save_root) / "tb_logs")
             self.tb_writer = SummaryWriter(log_dir=tb_log_dir)
             logger.info(f"TensorBoard logging to {tb_log_dir}")
@@ -108,6 +111,39 @@ class Trainer:
         self.transformer.train()
         self.transformer.requires_grad_(True)
 
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Load frozen VAE decoder for VGGT loss
+        self.vggt_loss_weight = getattr(config, 'vggt_loss_weight', 0.1)
+        self.vggt_loss_start_step = getattr(config, 'vggt_loss_start_step', 0)
+        self.vggt_loss_interval = getattr(config, 'vggt_loss_interval', 1)
+        self.vggt_num_sample_frames = getattr(config, 'vggt_num_sample_frames', 2)
+
+        self.vggt_grad_enabled = getattr(config, 'vggt_grad_enabled', True)
+
+        if self.vggt_loss_weight > 0:
+            logger.info("Loading frozen VAE for VGGT loss...")
+            vae_path = os.path.join(config.wan22_pretrained_model_name_or_path, 'vae')
+            self.vae = load_vae(vae_path, torch_dtype=self.dtype, torch_device=self.device)
+            self.vae.eval()
+            self.vae.requires_grad_(False)
+
+            logger.info("Loading frozen VGGT model...")
+            from vggt.models.vggt import VGGT as VGGTModel
+            self.vggt = VGGTModel.from_pretrained("facebook/VGGT-1B")
+            del self.vggt.camera_head
+            del self.vggt.track_head
+            self.vggt.camera_head = None
+            self.vggt.track_head = None
+            self.vggt.eval()
+            self.vggt.requires_grad_(False)
+            self.vggt.to(dtype=self.dtype, device=self.device)
+            logger.info(f"VGGT model loaded (grad_enabled={self.vggt_grad_enabled}).")
+        else:
+            self.vae = None
+            self.vggt = None
+
         # Optimizer
         self.optimizer = torch.optim.AdamW(
             [p for p in self.transformer.parameters() if p.requires_grad],
@@ -125,6 +161,12 @@ class Trainer:
         # Setup dataloaders
         logger.info("Setting up datasets...")
         train_dataset = MultiLatentLeRobotDataset(config=config)
+        max_samples = getattr(config, 'max_train_samples', 0)
+        if max_samples > 0 and max_samples < len(train_dataset):
+            logger.info(f"Limiting dataset from {len(train_dataset)} to {max_samples} samples (debug mode)")
+            train_dataset = torch.utils.data.Subset(
+                train_dataset, list(range(max_samples)))
+        logger.info(f"Dataset size: {len(train_dataset)}")
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=config.world_size,
@@ -150,23 +192,17 @@ class Trainer:
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
         self.train_loader_iter = None
-        # if hasattr(config, 'resume_from') and config.resume_from:
-        #     self._load_training_state(config.resume_from)
     
     def _get_next_batch(self):
-        """Get next batch from iterator, reset if epoch is finished."""
         if self.train_loader_iter is None:
             self.train_loader_iter = iter(self.train_loader)
-        
         try:
             batch = next(self.train_loader_iter)
         except StopIteration:
-            # Reset sampler and iterator when epoch finishes
             if hasattr(self.train_loader.sampler, 'set_epoch'):
                 self.train_loader.sampler.set_epoch(self.train_loader.sampler.epoch + 1)
             self.train_loader_iter = iter(self.train_loader)
             batch = next(self.train_loader_iter)
-        
         return batch
 
     @torch.no_grad()
@@ -176,22 +212,22 @@ class Trainer:
         timestep_ids = sample_timestep_id(batch_size=F, num_train_timesteps=train_scheduler.num_train_timesteps)
         noise = torch.zeros_like(latent).normal_()
         timesteps = train_scheduler.timesteps[timestep_ids].to(device=self.device)
-        noisy_latents =train_scheduler.add_noise(latent, noise, timesteps, t_dim=2)
-        targets =train_scheduler.training_target(latent, noise, timesteps)
+        noisy_latents = train_scheduler.add_noise(latent, noise, timesteps, t_dim=2)
+        targets = train_scheduler.training_target(latent, noise, timesteps)
 
         patch_f, patch_h, patch_w = self.patch_size
         if action_mode:
             patch_f = patch_h = patch_w = 1
         
         latent_grid_id = get_mesh_id(
-            latent.shape[-3] // patch_f,  # F
-            latent.shape[-2] // patch_h,  # H
-            latent.shape[-1] // patch_w,  # W
-            t=1 if action_mode else 0,  # 1 for action mode (0 for latent), not used
+            latent.shape[-3] // patch_f,
+            latent.shape[-2] // patch_h,
+            latent.shape[-1] // patch_w,
+            t=1 if action_mode else 0,
             f_w=1,
             f_shift=0,
             action=action_mode
-        ).to(self.device)  # shape: [4, seq_len]
+        ).to(self.device)
         latent_grid_id = latent_grid_id[None].repeat(B, 1, 1)
 
         if torch.rand(1).item() < noisy_cond_prob:
@@ -223,9 +259,6 @@ class Trainer:
 
     @torch.no_grad()
     def _prepare_input_dict(self, batch_dict):
-        """Prepare input dict following infer code pattern from wan_va_server.py."""
-        # Generate grid_id following infer code (no batch dimension yet)
-        # For action mode: get_mesh_id(shape[-3], shape[-2], shape[-1], t=1, f_w=1, f_shift, action=True)
         latent_dict = self._add_noise(
             latent=batch_dict['latents'], 
             train_scheduler=self.train_scheduler_latent, 
@@ -253,15 +286,11 @@ class Trainer:
         return input_dict
 
     def convert_input_format(self, input_dict):
-        """Convert input dict to match transformer input format if needed."""
         for key, value in input_dict.items():
-            input_dict[key] = value.to(self.device)#.to(self.dtype)
+            input_dict[key] = value.to(self.device)
         return input_dict
 
-    def compute_loss(self,
-        input_dict,
-        pred
-    ):
+    def compute_loss(self, input_dict, pred):
         latent_pred, action_pred = pred
         action_pred = rearrange(action_pred, 'b (f n) c -> b c f n 1', f=input_dict['action_dict']['targets'].shape[-3])
         latent_pred = data_seq_to_patch(
@@ -272,35 +301,165 @@ class Trainer:
         latent_loss_weight = self.train_scheduler_latent.training_weight(input_dict['latent_dict']['timesteps'].flatten()).reshape(Bn, Fn)
         action_loss_weight = self.train_scheduler_action.training_weight(input_dict['action_dict']['timesteps'].flatten()).reshape(Bn, Fn)
 
-        # Frame-wise video loss calculation
         latent_loss = F.mse_loss(latent_pred.float(), input_dict['latent_dict']['targets'].float().detach(), reduction='none')
         latent_loss = latent_loss * latent_loss_weight[:, None, :, None, None]
-        # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)
-        latent_loss = latent_loss.permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
-        latent_loss = latent_loss.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
-        # Sum per frame and compute mask per frame
-        latent_loss_per_frame = latent_loss.sum(dim=1)  # (B*F,)
-        latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)  # (B*F,)
+        latent_loss = latent_loss.permute(0, 2, 3, 4, 1)
+        latent_loss = latent_loss.flatten(0, 1).flatten(1)
+        latent_loss_per_frame = latent_loss.sum(dim=1)
+        latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)
         latent_loss = (latent_loss_per_frame / (latent_mask_per_frame + 1e-6)).mean()
 
-        # Frame-wise action loss calculation
         action_loss = F.mse_loss(action_pred.float(), input_dict['action_dict']['targets'].float().detach(), reduction='none')
         action_loss = action_loss * action_loss_weight[:, None, :, None, None]
         action_loss = action_loss * input_dict['action_dict']['actions_mask'].float()
-        # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)
-        action_loss = action_loss.permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
-        action_mask = input_dict['action_dict']['actions_mask'].float().permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
-        action_loss = action_loss.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
-        action_mask = action_mask.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
-        # Sum per frame and normalize by mask per frame
-        action_loss_per_frame = action_loss.sum(dim=1)  # (B*F,)
-        action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
+        action_loss = action_loss.permute(0, 2, 3, 4, 1)
+        action_mask = input_dict['action_dict']['actions_mask'].float().permute(0, 2, 3, 4, 1)
+        action_loss = action_loss.flatten(0, 1).flatten(1)
+        action_mask = action_mask.flatten(0, 1).flatten(1)
+        action_loss_per_frame = action_loss.sum(dim=1)
+        action_mask_per_frame = action_mask.sum(dim=1)
         action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
 
-        return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps
+        return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps, latent_pred
+
+    def _velocity_to_clean_latent(self, latent_pred, latent_dict):
+        """Approximate single-step denoising: recover clean latent from predicted velocity.
+
+        Flow matching:  x_t = (1-σ)*x_0 + σ*ε,  v = ε - x_0
+        => x_0 = x_t - σ * v
+
+        Returns (pred_clean, per_frame_sigmas) so downstream can weight by noise level.
+        """
+        noisy = latent_dict['noisy_latents']
+        timesteps = latent_dict['timesteps']  # [B, F]
+        sigmas = (timesteps / self.train_scheduler_latent.num_train_timesteps)
+        sigmas_expanded = sigmas[:, None, :, None, None]  # [B, 1, F, 1, 1]
+        pred_clean = noisy - sigmas_expanded.to(latent_pred.device) * latent_pred
+        return pred_clean, sigmas  # sigmas shape [B, F]
+
+    def _denormalize_latent(self, latent):
+        """Reverse the (mu - mean) / std normalization before VAE decode."""
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, -1, 1, 1, 1).to(latent.device, latent.dtype))
+        latents_std = (
+            torch.tensor(self.vae.config.latents_std)
+            .view(1, -1, 1, 1, 1).to(latent.device, latent.dtype))
+        return latent * latents_std + latents_mean
+
+    def _decode_latent_to_pixels(self, latent, frame_indices, enable_grad=False):
+        """Decode selected latent frames to pixel images via frozen VAE decoder.
+
+        Handles latent denormalization and pixel range conversion (VAE outputs
+        [-1,1], VGGT expects [0,1]).
+        """
+        B, C, F, H, W = latent.shape
+        selected = latent[:, :, frame_indices]
+        selected = self._denormalize_latent(selected).to(self.dtype)
+        selected = rearrange(selected, 'b c f h w -> (b f) c 1 h w')
+        if enable_grad:
+            pixels = self.vae.decode(selected).sample
+        else:
+            with torch.no_grad():
+                pixels = self.vae.decode(selected).sample
+        pixels = rearrange(pixels, '(b f) c 1 h w -> b f c h w', b=B)
+        pixels = ((pixels + 1.0) / 2.0).clamp(0, 1)
+        return pixels
+
+    def _compute_vggt_features(self, pixel_frames, enable_grad=False):
+        """Extract VGGT depth and point features from pixel frames.
+
+        When enable_grad=True, gradients flow from features back to input pixels.
+        VGGT weights are frozen but autograd traces through ops for the input.
+        """
+        B, num_f, C, H, W = pixel_frames.shape
+        target_h, target_w = 518, 518
+        frames_resized = F.interpolate(
+            pixel_frames.reshape(B * num_f, C, H, W),
+            size=(target_h, target_w),
+            mode='bilinear',
+            align_corners=False
+        ).reshape(B, num_f, C, target_h, target_w)
+
+        if enable_grad:
+            with torch.cuda.amp.autocast(dtype=self.dtype):
+                aggregated_tokens_list, ps_idx = self.vggt.aggregator(frames_resized)
+                depth_map, depth_conf = self.vggt.depth_head(
+                    aggregated_tokens_list, images=frames_resized, patch_start_idx=ps_idx)
+                point_map, point_conf = self.vggt.point_head(
+                    aggregated_tokens_list, images=frames_resized, patch_start_idx=ps_idx)
+        else:
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(dtype=self.dtype):
+                    aggregated_tokens_list, ps_idx = self.vggt.aggregator(frames_resized)
+                    depth_map, depth_conf = self.vggt.depth_head(
+                        aggregated_tokens_list, images=frames_resized, patch_start_idx=ps_idx)
+                    point_map, point_conf = self.vggt.point_head(
+                        aggregated_tokens_list, images=frames_resized, patch_start_idx=ps_idx)
+
+        return {
+            'depth': depth_map,
+            'point_map': point_map,
+            'depth_conf': depth_conf,
+            'point_conf': point_conf,
+        }
+
+    def compute_vggt_loss(self, latent_pred, input_dict):
+        """Compute VGGT geometric alignment loss.
+
+        Decodes a subset of frames from predicted and GT latents, runs VGGT,
+        and computes confidence-weighted L1 loss on depth and point maps.
+
+        Frames with lower noise (small sigma) get higher weight because the
+        single-step x_0 estimate is more accurate there.
+
+        Gradient flow (when vggt_grad_enabled=True):
+            transformer -> latent_pred -> velocity_to_clean -> VAE decode -> VGGT -> loss
+        """
+        if self.vggt is None or self.vae is None:
+            return torch.tensor(0.0, device=self.device)
+
+        latent_dict = input_dict['latent_dict']
+        pred_clean, sigmas = self._velocity_to_clean_latent(latent_pred, latent_dict)
+        gt_clean = latent_dict['latent']
+
+        B, C, F, H, W = pred_clean.shape
+        num_sample = min(self.vggt_num_sample_frames, F)
+        if F <= num_sample:
+            frame_indices = list(range(F))
+        else:
+            frame_indices = torch.linspace(0, F - 1, num_sample).long().tolist()
+
+        # Per-frame weight: low noise → high weight (sigma=0 → w=1, sigma=1 → w=0)
+        frame_sigmas = sigmas[:, frame_indices].detach()  # [B, num_sample]
+        sigma_weights = (1.0 - frame_sigmas).clamp(min=0.05)  # [B, num_sample]
+
+        grad_on = self.vggt_grad_enabled
+
+        pred_pixels = self._decode_latent_to_pixels(pred_clean, frame_indices, enable_grad=grad_on)
+        pred_feats = self._compute_vggt_features(pred_pixels, enable_grad=grad_on)
+
+        with torch.no_grad():
+            gt_pixels = self._decode_latent_to_pixels(gt_clean, frame_indices, enable_grad=False)
+            gt_feats = self._compute_vggt_features(gt_pixels, enable_grad=False)
+
+        gt_depth_conf = gt_feats['depth_conf'].float().detach()
+        gt_point_conf = gt_feats['point_conf'].float().detach()
+        depth_conf_mask = (gt_depth_conf > gt_depth_conf.median()).float()
+        point_conf_mask = (gt_point_conf > gt_point_conf.median()).float()
+
+        depth_diff = (pred_feats['depth'].float() - gt_feats['depth'].float().detach()).abs()
+        point_diff = (pred_feats['point_map'].float() - gt_feats['point_map'].float().detach()).abs()
+
+        # Apply sigma weight per frame: [B, num_sample] -> [B, num_sample, 1, 1]
+        sw = sigma_weights[:, :, None, None]
+
+        depth_loss = (depth_diff.squeeze(-1) * depth_conf_mask * sw).sum() / (depth_conf_mask.sum() + 1e-6)
+        point_loss = (point_diff.mean(-1) * point_conf_mask * sw).sum() / (point_conf_mask.sum() + 1e-6)
+
+        return depth_loss + point_loss
 
     def _train_step(self, batch, batch_idx):
-        """Train a single batch, returns losses for logging."""
         batch = self.convert_input_format(batch)
         input_dict = self._prepare_input_dict(batch)
         
@@ -312,14 +471,23 @@ class Trainer:
             self.transformer.set_requires_gradient_sync(True)
 
         output = self.transformer(input_dict, train_mode=True)
-        latent_loss, action_loss = self.compute_loss(input_dict, output)
+        latent_loss, action_loss, latent_pred = self.compute_loss(input_dict, output)
         loss = latent_loss + action_loss
+
+        vggt_loss_val = torch.tensor(0.0, device=self.device)
+        if self.vggt_loss_weight > 0 and self.step >= self.vggt_loss_start_step:
+            vggt_input = latent_pred if self.vggt_grad_enabled else latent_pred.detach()
+            vggt_loss_val = self.compute_vggt_loss(vggt_input, input_dict)
+            loss = loss + self.vggt_loss_weight * vggt_loss_val / self.gradient_accumulation_steps
 
         loss.backward()
 
-        losses = {'latent_loss': latent_loss.detach(), 'action_loss': action_loss.detach()}
+        losses = {
+            'latent_loss': latent_loss.detach(),
+            'action_loss': action_loss.detach(),
+            'vggt_loss': vggt_loss_val.detach(),
+        }
         
-        # Only update weights after accumulating gradients
         if should_sync:
             total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
             self.optimizer.step()
@@ -333,54 +501,34 @@ class Trainer:
 
         return losses
 
-    def save_checkpoint(self,):
-        """Save model checkpoint in the same format as pretrained model."""
+    def save_checkpoint(self):
         try:
             state_dict = get_model_state_dict(
                 self.transformer,
                 options=StateDictOptions(full_state_dict=True, cpu_offload=True),
             )
             state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
-            # optim_state = get_optimizer_state_dict(
-            #         self.transformer, self.optimizer,
-            #         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-            #     )
 
-            # Only rank 0 saves the checkpoint
             if self.config.rank == 0:
                 checkpoint_dir = self.save_dir / f"checkpoint_step_{self.step}"
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-                # Save transformer in the same format as pretrained model
                 transformer_dir = checkpoint_dir / "transformer"
                 transformer_dir.mkdir(parents=True, exist_ok=True)
 
                 logger.info(f"Saving transformer to {transformer_dir}")
 
-                # Manually save in diffusers format (outside FSDP context to avoid deadlock)
-                # Save model weights
                 model_file = transformer_dir / "diffusion_pytorch_model.safetensors"
                 save_file(state_dict_bf16, model_file)
 
-                # Save config (copy from original transformer config and update _name_or_path)
                 config_file = transformer_dir / "config.json"
                 config_dict = dict(self.transformer.config)
                 config_dict.pop('_name_or_path', None)
                 with open(config_file, 'w') as f:
                     json.dump(config_dict, f, indent=2)
 
-                # # Save optimizer state and training metadata in PyTorch format
-                # training_state_path = checkpoint_dir / "training_state.pt"
-                # logger.info(f"Saving training state to {training_state_path}")
-                # torch.save({
-                #     'step': self.step,
-                #     'optimizer_state_dict': optim_state,
-                #     'config': vars(self.config),
-                # }, training_state_path)
-
                 logger.info(f"Checkpoint saved successfully at step {self.step}")
 
-            # Synchronize all processes after saving
             if dist.is_initialized():
                 dist.barrier()
 
@@ -389,49 +537,17 @@ class Trainer:
                 logger.error(f"Failed to save checkpoint: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
-            # Ensure all processes stay synchronized even on error
             if dist.is_initialized():
                 dist.barrier()
 
-    def _load_training_state(self, checkpoint_path):
-        """Load training state (optimizer + step) after FSDP and optimizer creation."""
-        checkpoint_dir = Path(checkpoint_path)
-        training_state_path = checkpoint_dir / "training_state.pt"
-
-        if not training_state_path.exists():
-            if self.config.rank == 0:
-                logger.warning(f"Training state not found: {training_state_path}, starting from step 0")
-            return
-
-        if self.config.rank == 0:
-            logger.info(f"Loading training state from {training_state_path}")
-
-        # All ranks load the training state directly
-        training_state = torch.load(training_state_path, map_location='cpu', weights_only=False)
-
-        # All ranks load optimizer state (required for FSDP)
-        set_optimizer_state_dict(
-            self.transformer, self.optimizer,
-            optim_state_dict=training_state['optimizer_state_dict'],
-            options=StateDictOptions(full_state_dict=True, strict=False)
-        )
-        self.step = training_state.get('step', 0)
-
-        if self.config.rank == 0:
-            logger.info(f"Training state loaded, resuming from step {self.step}")
-
-        # Synchronize all ranks
-        if dist.is_initialized():
-            dist.barrier()
-
     def train(self):
-        """Main training loop - train by steps instead of epochs."""
-        logger.info(f"Starting training for {self.config.num_steps} steps...")
+        logger.info(f"Starting VGGT-augmented training for {self.config.num_steps} steps...")
+        logger.info(f"VGGT loss weight: {self.vggt_loss_weight}, start step: {self.vggt_loss_start_step}, interval: {self.vggt_loss_interval}")
         self.transformer.train()
 
         progress_bar = tqdm(
             total=self.config.num_steps,
-            desc="Training",
+            desc="Training (VGGT)",
             disable=(self.config.rank != 0),
             leave=True,
             dynamic_ncols=True,
@@ -441,32 +557,31 @@ class Trainer:
         self.optimizer.zero_grad()
         accumulated_latent_losses = []
         accumulated_action_losses = []
+        accumulated_vggt_losses = []
         step_in_accumulation = 0
 
         while self.step < self.config.num_steps:
-            # Get next batch (handles epoch reset automatically)
             batch = self._get_next_batch()
             
             losses = self._train_step(batch, step_in_accumulation)
             
-            # Accumulate losses for logging
             accumulated_latent_losses.append(losses['latent_loss'])
             accumulated_action_losses.append(losses['action_loss'])
+            accumulated_vggt_losses.append(losses['vggt_loss'])
             step_in_accumulation += 1
 
-            # Log and checkpoint when optimizer steps
             if losses['should_log']:
                 lr = self.lr_scheduler.get_last_lr()[0]
 
-                # Average accumulated losses
                 latent_loss_show = dist_mean(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
                 action_loss_show = dist_mean(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
+                vggt_loss_show = dist_mean(torch.stack(accumulated_vggt_losses).sum()).detach().cpu().item()
                 max_latent_loss_show = dist_max(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
                 max_action_loss_show = dist_max(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
 
-                # Clear accumulated losses
                 accumulated_latent_losses = []
                 accumulated_action_losses = []
+                accumulated_vggt_losses = []
                 step_in_accumulation = 0
 
                 torch.cuda.synchronize()
@@ -478,16 +593,27 @@ class Trainer:
                     total_norm = losses['total_norm']
                     progress_bar.n += self.gradient_accumulation_steps
                     progress_bar.set_postfix({
-                        'latent_loss': f'{latent_loss_show:.4f}',
-                        'action_loss': f'{action_loss_show:.4f}',
+                        'lat': f'{latent_loss_show:.4f}',
+                        'act': f'{action_loss_show:.4f}',
+                        'vggt': f'{vggt_loss_show:.4f}',
                         'step': self.step,
-                        'grad_norm': f'{total_norm.item():.2f}',
+                        'gn': f'{total_norm.item():.2f}',
                         'lr': f'{lr:.2e}'
                     })
+                    if self.tb_writer is not None:
+                        self.tb_writer.add_scalar('loss/video', latent_loss_show, self.step)
+                        self.tb_writer.add_scalar('loss/action', action_loss_show, self.step)
+                        self.tb_writer.add_scalar('loss/vggt', vggt_loss_show, self.step)
+                        self.tb_writer.add_scalar('loss/video_max', max_latent_loss_show, self.step)
+                        self.tb_writer.add_scalar('loss/action_max', max_action_loss_show, self.step)
+                        self.tb_writer.add_scalar('train/grad_norm', total_norm.item(), self.step)
+                        self.tb_writer.add_scalar('train/lr', lr, self.step)
+
                     if self.config.enable_wandb:
                         self.wandb.log({
                             'loss_metrics/global_avg_video_loss': latent_loss_show,
                             'loss_metrics/global_avg_action_loss': action_loss_show,
+                            'loss_metrics/global_avg_vggt_loss': vggt_loss_show,
                             'loss_metrics/global_max_video_loss': max_latent_loss_show,
                             'loss_metrics/global_max_action_loss': max_action_loss_show,
                             'grad_norm': total_norm.item(),
@@ -511,7 +637,6 @@ class Trainer:
 
 
 def run(args):
-    """Main entry point."""
     config = VA_CONFIGS[args.config_name]
 
     rank = int(os.getenv("RANK", 0))
@@ -531,17 +656,16 @@ def run(args):
         logger.info(f"Using config: {args.config_name}")
         logger.info(f"World size: {world_size}, Local rank: {local_rank}")
 
-    trainer = Trainer(config)
+    trainer = VGGTTrainer(config)
     trainer.train()
 
 
 def main():
-    """Parse arguments and run training."""
-    parser = argparse.ArgumentParser(description="Train WAN model for robotics")
+    parser = argparse.ArgumentParser(description="Train WAN model with VGGT alignment loss")
     parser.add_argument(
         "--config-name",
         type=str,
-        default='robotwin_train',
+        default='robotwin_train_vggt',
         help="Config name",
     )
     parser.add_argument(

@@ -77,9 +77,12 @@ class VA_Server:
             torch_device='cpu' if self.enable_offload else self.device,
         )
 
+        transformer_path = os.path.join(job_config.wan22_pretrained_model_name_or_path, 'transformer')
+        if getattr(job_config, 'ckpt_path', None):
+            transformer_path = os.path.join(job_config.ckpt_path, 'transformer')
+            logger.info(f"Loading transformer from checkpoint: {transformer_path}")
         self.transformer = load_transformer(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'transformer'),
+            transformer_path,
             torch_dtype=self.dtype,
             torch_device=self.device,
         )
