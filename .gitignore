@@ -1,0 +1,38 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ---- IDE / OS ----
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# ---- Training outputs / logs / wandb ----
+train_out/
+logs/
+wandb/
+visualization/
+visualization_latent_rerank/
+*.log
+pids.txt
+
+# ---- Large assets that should not be versioned ----
+*.pdf
+*.mp4
+*.safetensors
+*.ckpt
+*.pt
+
+# ---- Local scratch scripts / configs ----
+client.log
+server.log
+
+# ---- Notes: track exceptions if needed with  !filename  ----
