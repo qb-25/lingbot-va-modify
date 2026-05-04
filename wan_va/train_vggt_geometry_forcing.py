@@ -183,29 +183,7 @@ class GeometryForcingTrainer(base_train.VGGTTrainer):
         sigma_weights = (1.0 - frame_sigmas).clamp(min=0.05)
         return frame_sigmas, sigma_weights
 
-    def _select_vggt_supervision_pixels(self, pixel_frames):
-        """Select the image region used for VGGT supervision.
-
-        Wan-VA decodes a vertically-stacked multi-camera image whose height =
-        sum(cam_i.height). When `vggt_supervision_cam == 'cam_high'`, we crop
-        the bottom `config.height x config.width` region (cam_high view).
-        Self-contained copy of the implementation in the base trainer's
-        bytecode so this trainer works even if its source has been removed.
-        """
-        if getattr(self, 'vggt_supervision_cam', None) is None:
-            self.vggt_supervision_cam = getattr(self.config, 'vggt_supervision_cam', 'cam_high')
-        if self.vggt_supervision_cam != 'cam_high':
-            return pixel_frames
-        target_h = self.config.height
-        target_w = self.config.width
-        _, _, _, full_h, full_w = pixel_frames.shape
-        if full_h < target_h or full_w < target_w:
-            raise ValueError(
-                f"Decoded video is smaller than cam_high crop: got "
-                f"({full_h}, {full_w}), expected at least ({target_h}, {target_w})"
-            )
-        h_start = full_h - target_h
-        return pixel_frames[:, :, :, h_start:, :target_w]
+    # _select_vggt_supervision_pixels is inherited from base_train.VGGTTrainer.
 
     # ------------------------------------------------------------------
     # Teacher features: run frozen VGGT aggregator on GT-decoded pixels.

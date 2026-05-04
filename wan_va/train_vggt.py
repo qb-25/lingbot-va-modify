@@ -459,6 +459,60 @@ class VGGTTrainer:
 
         return depth_loss + point_loss
 
+    def _select_vggt_supervision_pixels(self, pixel_frames):
+        """Select the image region used for VGGT supervision.
+
+        Wan-VA decodes a vertically-stacked multi-camera image whose height
+        equals sum(cam_i.height). When ``config.vggt_supervision_cam ==
+        'cam_high'`` (default), we crop the bottom ``config.height x
+        config.width`` region (which corresponds to the cam_high view in the
+        stacked layout). For any other value, the full pixel tensor is
+        returned unchanged.
+
+        Args:
+            pixel_frames: Tensor of shape (B, F, C, full_h, full_w) in [0, 1].
+
+        Returns:
+            Tensor of shape (B, F, C, target_h, target_w).
+        """
+        cam = getattr(self.config, 'vggt_supervision_cam', 'cam_high')
+        if cam != 'cam_high':
+            return pixel_frames
+        target_h = self.config.height
+        target_w = self.config.width
+        _, _, _, full_h, full_w = pixel_frames.shape
+        if full_h < target_h or full_w < target_w:
+            raise ValueError(
+                f"Decoded video is smaller than cam_high crop: got "
+                f"({full_h}, {full_w}), expected at least ({target_h}, {target_w})"
+            )
+        h_start = full_h - target_h
+        return pixel_frames[:, :, :, h_start:, :target_w]
+
+    def _tb_add_scalar(self, tag, scalar_value, global_step):
+        """Safe TensorBoard scalar writer.
+
+        Writes to ``self.tb_writer`` if available; on ``OSError`` (e.g. disk
+        full / device error from cloud storage), logs a warning on rank 0,
+        closes the writer, and disables further TensorBoard logging for the
+        rest of training. Any other exception is re-raised.
+        """
+        if self.tb_writer is None:
+            return
+        try:
+            self.tb_writer.add_scalar(tag, scalar_value, global_step)
+        except OSError as e:
+            if self.config.rank == 0:
+                logger.warning(
+                    'TensorBoard write failed (%s); disabling TensorBoard.', e
+                )
+            try:
+                self.tb_writer.flush()
+                self.tb_writer.close()
+            except Exception:
+                pass
+            self.tb_writer = None
+
     def _train_step(self, batch, batch_idx):
         batch = self.convert_input_format(batch)
         input_dict = self._prepare_input_dict(batch)
