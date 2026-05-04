@@ -1,4 +1,11 @@
 #!/usr/bin/bash
+#
+# Weights & Biases (optional): before calling this script, set e.g.
+#   export ENABLE_WANDB=1
+#   export WANDB_API_KEY='...'   # if you must put it in the DLC command, prefix the whole line (risk: logs/history leak)
+#   export WANDB_PROJECT=lingbotva
+#   export WANDB_TEAM_NAME=...   # optional
+#   export WANDB_RUN_NAME=my_run # optional
 
 set -x
 
@@ -16,10 +23,13 @@ if [ $# -ne 0 ]; then
     overrides="$*"
 fi
 
-export WANDB_API_KEY="${WANDB_API_KEY:-your_wandb_api_key}"
-export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.wandb.ai}"
-export WANDB_TEAM_NAME="${WANDB_TEAM_NAME:-your_team_name}"
-export WANDB_PROJECT="${WANDB_PROJECT:-lingbotva}"
+WANDB_ARGS=()
+if [ "${ENABLE_WANDB:-0}" = "1" ]; then
+  WANDB_ARGS+=(--enable-wandb)
+  if [ -n "${WANDB_RUN_NAME:-}" ]; then
+    WANDB_ARGS+=(--wandb-run-name "${WANDB_RUN_NAME}")
+  fi
+fi
 
 ## node setting
 num_gpu=${NGPU}
@@ -36,4 +46,4 @@ python -m torch.distributed.run \
     --local-ranks-filter=${log_rank} \
     --master_port ${master_port} \
     --tee 3 \
-    -m wan_va.train_vggt --config-name ${config_name} $overrides
+    -m wan_va.train_vggt --config-name ${config_name} "${WANDB_ARGS[@]}" $overrides

@@ -6,12 +6,14 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-robowin_root = Path("/mnt/data/qianbin/RoboTwin")
+robowin_root = Path(os.environ.get("ROBOTWIN_ROOT", "/mnt/data/qianbin/RoboTwin")).resolve()
+if not robowin_root.is_dir():
+    raise FileNotFoundError(
+        f"RoboTwin 根目录不存在: {robowin_root}。请在 DLC 挂载数据盘或设置环境变量 ROBOTWIN_ROOT。"
+    )
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 
-
-import os
 os.chdir(robowin_root)
 
 from envs import CONFIGS_PATH
@@ -397,9 +399,13 @@ def main(usr_args):
     test_num = usr_args["test_num"]
 
     
-    model = WebsocketClientPolicy(port=usr_args['port'])
+    policy_host = usr_args.get(
+        "policy_host",
+        os.environ.get("POLICY_HOST", "127.0.0.1"),
+    )
+    model = WebsocketClientPolicy(host=policy_host, port=usr_args["port"])
 
-    save_vis = usr_args.get("save_visualization", False)
+    save_vis = usr_args.get("save_visualization", True)
     st_seed, suc_num = eval_policy(task_name,
                                    TASK_ENV,
                                    args,
@@ -450,7 +456,7 @@ def eval_policy(task_name,
                 test_num=100,
                 video_size=None,
                 instruction_type=None,
-                save_visualization=False,
+                save_visualization=True,
                 video_guidance_scale=5.0,
                 action_guidance_scale=5.0):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
@@ -692,12 +698,21 @@ def parse_args_and_config():
         overrides = parse_override_pairs(args.overrides)
         config.update(overrides)
 
+    if "policy_host" not in config:
+        ph = os.environ.get("POLICY_HOST")
+        if ph:
+            config["policy_host"] = ph
+
     return config
 
 
 if __name__ == "__main__":
-    
-    Sapien_TEST()
+    # Sapien_TEST 会尝试初始化光追渲染，无显示/无 Vulkan 的 DLC 节点上会失败并 exit()。
+    # 无头评测请设置: export SKIP_SAPIEN_TEST=1
+    if os.environ.get("SKIP_SAPIEN_TEST", "0") == "1":
+        print("SKIP_SAPIEN_TEST=1: 跳过 Sapien_TEST()（适用于无头 / DLC）。")
+    else:
+        Sapien_TEST()
     usr_args = parse_args_and_config()
     main(usr_args)
 

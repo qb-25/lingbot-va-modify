@@ -1,0 +1,28 @@
+from easydict import EasyDict
+
+from .va_robotwin_train_vggt_repa_vae_cfg import va_robotwin_train_vggt_repa_vae_cfg
+
+
+va_robotwin_train_vggt_repa_vae_debug_cfg = EasyDict(
+    __name__='Config: VA robotwin VGGT + VAE-REPA debug'
+)
+va_robotwin_train_vggt_repa_vae_debug_cfg.update(va_robotwin_train_vggt_repa_vae_cfg)
+
+va_robotwin_train_vggt_repa_vae_debug_cfg.save_root = './train_out/vggt_repa_vae_debug'
+va_robotwin_train_vggt_repa_vae_debug_cfg.max_train_samples = 8
+va_robotwin_train_vggt_repa_vae_debug_cfg.load_worker = 0
+va_robotwin_train_vggt_repa_vae_debug_cfg.disable_train_shuffle = True
+va_robotwin_train_vggt_repa_vae_debug_cfg.debug_seed = 42
+va_robotwin_train_vggt_repa_vae_debug_cfg.cfg_prob = 0.0
+va_robotwin_train_vggt_repa_vae_debug_cfg.latent_noisy_cond_prob = 0.0
+va_robotwin_train_vggt_repa_vae_debug_cfg.fixed_chunk_size = 1
+va_robotwin_train_vggt_repa_vae_debug_cfg.fixed_window_size = 16
+va_robotwin_train_vggt_repa_vae_debug_cfg.fixed_latent_timestep_id = 100
+va_robotwin_train_vggt_repa_vae_debug_cfg.fixed_action_timestep_id = 100
+
+va_robotwin_train_vggt_repa_vae_debug_cfg.num_steps = 300
+va_robotwin_train_vggt_repa_vae_debug_cfg.save_interval = 100
+va_robotwin_train_vggt_repa_vae_debug_cfg.gc_interval = 20
+
+va_robotwin_train_vggt_repa_vae_debug_cfg.vggt_loss_weight = 0.05
+va_robotwin_train_vggt_repa_vae_debug_cfg.vggt_loss_start_step = 0

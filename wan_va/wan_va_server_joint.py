@@ -5,6 +5,7 @@
 import argparse
 import os
 import sys
+import time
 
 import torch
 import torch.nn.functional as F
@@ -140,6 +141,10 @@ class VA_Server_Joint(VA_Server):
 
         cfg_batch = 2 if self.use_cfg else 1
 
+        torch.cuda.synchronize()
+        _t_infer_start = time.perf_counter()
+        _forward_count = 0
+
         with torch.no_grad():
             for i in tqdm(range(len(video_ts)), desc='Joint denoise'):
                 last_step = (i == len(video_ts) - 1)
@@ -166,6 +171,7 @@ class VA_Server_Joint(VA_Server):
                      'action_input': a_in},
                     update_cache=1 if last_step else 0,
                     cache_name=self.cache_name)
+                _forward_count += 1
 
                 if not last_step:
                     # --- video scheduler step ---
@@ -201,6 +207,15 @@ class VA_Server_Joint(VA_Server):
                 if frame_st_id == 0:
                     latents[:, :, 0:1] = latent_cond
                     actions[:, :, 0:1] = action_cond
+
+        torch.cuda.synchronize()
+        _t_infer_end = time.perf_counter()
+
+        logger.info(
+            f"[Joint Timing] chunk={frame_st_id} | "
+            f"total={_t_infer_end - _t_infer_start:.3f}s | "
+            f"steps={len(video_ts)} | "
+            f"forwards={_forward_count}")
 
         actions[:, ~self.action_mask] *= 0
 

@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+import os
+
 from easydict import EasyDict
 
 from .shared_config import va_shared_cfg
@@ -7,7 +9,10 @@ va_robotwin_cfg = EasyDict(__name__='Config: VA robotwin')
 va_robotwin_cfg.update(va_shared_cfg)
 
 va_robotwin_cfg.wan22_pretrained_model_name_or_path = "/mnt/data/models/lingbot-va-base"
-va_robotwin_cfg.ckpt_path = "/mnt/data/qianbin/lingbot-va/train_out/checkpoints/checkpoint_step_50000"
+va_robotwin_cfg.ckpt_path = os.getenv(
+    "CKPT_PATH",
+    "/mnt/nas/qb/lingbot_va_checkpoints/checkpoint_step_50000",
+)
 
 va_robotwin_cfg.attn_window = 72
 va_robotwin_cfg.frame_chunk_size = 2

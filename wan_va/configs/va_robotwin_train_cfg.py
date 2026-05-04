@@ -23,5 +23,5 @@ va_robotwin_train_cfg.beta2 = 0.95
 va_robotwin_train_cfg.weight_decay = 0.1
 va_robotwin_train_cfg.warmup_steps = 10
 va_robotwin_train_cfg.batch_size = 1 
-va_robotwin_train_cfg.gradient_accumulation_steps = 1
+va_robotwin_train_cfg.gradient_accumulation_steps = 8
 va_robotwin_train_cfg.num_steps = 50000 

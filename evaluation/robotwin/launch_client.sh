@@ -11,7 +11,7 @@ task_groups=(
   "place_empty_cup blocks_ranking_rgb place_empty_cup blocks_ranking_rgb place_empty_cup blocks_ranking_rgb place_empty_cup blocks_ranking_rgb"
 )
 
-save_root=${1:-'./results'}
+save_root=${1:-'./leresult/top2'}
 task_name=${2:-"adjust_bottle"}
 
 policy_name=ACT

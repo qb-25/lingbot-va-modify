@@ -31,4 +31,6 @@ for i in {0..7}; do
 done
 
 echo "All 8 joint-denoising instances launched in background."
-wait
+if [ "${EVAL_SERVER_WAIT_ALL:-0}" = "1" ]; then
+    wait
+fi

@@ -1,6 +1,5 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.datasets.utils import get_episode_data_index
 from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
 import numpy as np
 from pathlib import Path
@@ -14,6 +13,9 @@ from einops import rearrange
 from torch.utils.data import DataLoader
 from scipy.spatial.transform import Rotation as R
 from lerobot.constants import HF_LEROBOT_HOME
+from lerobot.datasets.utils import get_safe_version
+import pyarrow.parquet as pq
+import packaging.version
 
 def recursive_find_file(directory, filename='info.json'):
     result = []
@@ -47,8 +49,11 @@ def construct_lerobot_multi_processor(config,
     )
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
     repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
-    with Pool(num_init_worker) as pool:
-        datasets_out_lst = pool.map(construct_func, repo_list)
+    if num_init_worker <= 1:
+        datasets_out_lst = [construct_func(repo_id) for repo_id in repo_list]
+    else:
+        with Pool(num_init_worker) as pool:
+            datasets_out_lst = pool.map(construct_func, repo_list)
                 
     return datasets_out_lst
 
@@ -71,8 +76,11 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         config,
-        num_init_worker=128,
+        num_init_worker=None,
     ):
+        if num_init_worker is None:
+            num_init_worker = getattr(config, 'dataset_init_worker', getattr(config, 'load_worker', 8))
+        num_init_worker = max(1, int(num_init_worker))
         self._datasets = construct_lerobot_multi_processor(config, 
                                                            num_init_worker, 
                                                            )
@@ -111,6 +119,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         repo_id,
         config=None,
     ):
+        download_videos = True
         self.repo_id = repo_id
         self.root = HF_LEROBOT_HOME / repo_id
         self.image_transforms = None
@@ -134,12 +143,9 @@ class LatentLeRobotDataset(LeRobotDataset):
         
         try:
             assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
-            self.hf_dataset = self.load_hf_dataset()
         except (AssertionError, FileNotFoundError, NotADirectoryError):
             self.revision = get_safe_version(self.repo_id, self.revision)
             self.download_episodes(download_videos)
-            self.hf_dataset = self.load_hf_dataset()
-        self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
         
         self.latent_path = Path(repo_id) / 'latents'
         self.empty_emb = torch.load(config.empty_emb_path, weights_only=False)
@@ -148,12 +154,16 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.used_video_keys = config.obs_cam_keys
         self.q01 = np.array(config.norm_stat['q01'], dtype='float')[None]
         self.q99 = np.array(config.norm_stat['q99'], dtype='float')[None]
-        self._hf_torch_view = self.hf_dataset.with_format(
-                type='torch',
-                columns=['action'],
-                output_all_columns=False
-            )
+        self._episode_action_cache = {}
         self.parse_meta()
+
+    def _load_episode_actions(self, episode_index: int):
+        if episode_index not in self._episode_action_cache:
+            parquet_path = self.root / self.meta.get_data_file_path(episode_index)
+            action_table = pq.read_table(parquet_path, columns=["action"])
+            action_array = np.asarray(action_table["action"].to_pylist(), dtype=np.float32)
+            self._episode_action_cache[episode_index] = action_array
+        return self._episode_action_cache[episode_index]
 
     def parse_meta(self):
         out = []
@@ -190,13 +200,9 @@ class LatentLeRobotDataset(LeRobotDataset):
                 return False
         return True
 
-    def _get_global_idx(self, episode_index: int, local_index: int):
-        ep_start = self.episode_data_index["from"][episode_index]
-        return local_index + ep_start
-
-    def _get_range_hf_data(self, start_frame, end_frame):
-        batch = self._hf_torch_view[start_frame:end_frame]
-        return batch
+    def _get_range_hf_data(self, episode_index, start_frame, end_frame):
+        actions = self._load_episode_actions(episode_index)
+        return {"action": actions[start_frame:end_frame]}
 
     def _flatten_latent_dict(self, latent_dict):
         out = {}
@@ -295,10 +301,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         ori_data_dict = self._get_range_latent_data(start_frame, end_frame, episode_index)
 
         latent_frame_ids = ori_data_dict[f"{self.used_video_keys[0]}.frame_ids"]
-        start_frame = self._get_global_idx(episode_index, start_frame)
-        end_frame = self._get_global_idx(episode_index, end_frame)
-
-        hf_data_frames = self._get_range_hf_data(start_frame, end_frame)
+        hf_data_frames = self._get_range_hf_data(episode_index, start_frame, end_frame)
         ori_data_dict.update(hf_data_frames)
         out_dict = self._cat_video_latents(ori_data_dict)
 
