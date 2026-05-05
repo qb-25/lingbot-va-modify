@@ -55,18 +55,45 @@ import gc
 
 class VGGTTrainer:
     def __init__(self, config):
-        if config.enable_wandb and config.rank == 0:
-            wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
-            self.wandb = wandb
-            self.wandb.init(
-                entity=os.environ["WANDB_TEAM_NAME"],
-                project=os.getenv("WANDB_PROJECT", "va_robotwin_vggt"),
-                config=config,
-                mode="online",
-                name='train_vggt'
-            )
-            logger.info("WandB logging enabled")
+        # Default state for optional logging backends so that downstream code
+        # can safely check `if self.wandb is not None:` even when wandb is off
+        # or when wandb startup fails (missing env vars, network, ...).
+        self.wandb = None
         self.tb_writer = None
+
+        if config.enable_wandb and config.rank == 0:
+            try:
+                base_url = os.environ.get('WANDB_BASE_URL', 'https://api.wandb.ai')
+                api_key = os.environ.get('WANDB_API_KEY')
+                if not api_key:
+                    raise RuntimeError(
+                        "config.enable_wandb=True but env WANDB_API_KEY is not set. "
+                        "Either unset enable_wandb or export WANDB_API_KEY."
+                    )
+                wandb.login(host=base_url, key=api_key)
+                run_name = (
+                    getattr(config, 'wandb_run_name', None)
+                    or os.environ.get('WANDB_RUN_NAME')
+                    or 'train_vggt'
+                )
+                init_kwargs = dict(
+                    project=os.environ.get('WANDB_PROJECT', 'va_robotwin_vggt'),
+                    config=config,
+                    mode='online',
+                    name=run_name,
+                )
+                team_name = os.environ.get('WANDB_TEAM_NAME')
+                if team_name:
+                    init_kwargs['entity'] = team_name
+                wandb.init(**init_kwargs)
+                self.wandb = wandb
+                logger.info(f"WandB logging enabled (run='{run_name}', host={base_url})")
+            except Exception as e:
+                logger.warning(
+                    f"Failed to start wandb ({type(e).__name__}: {e}); "
+                    "continuing without wandb."
+                )
+                self.wandb = None
         if config.rank == 0 and SummaryWriter is not None:
             tb_log_dir = str(Path(config.save_root) / "tb_logs")
             self.tb_writer = SummaryWriter(log_dir=tb_log_dir)
