@@ -262,6 +262,36 @@ class WanTransformer3DModel(BaseWanTransformer3DModel):
                 requested_layers = {int(align_layer_idx)}
         captured_hidden_states = {}
 
+        # ---- Cross-stream alignment hooks (capture *both* video and action) ----
+        # Independent from align_layer_idx so the two objectives can run on
+        # different layers without interfering. Set ``xstream_layers`` to a
+        # list[int] of block indices; the model returns a dict
+        #   ``xstream_hidden_states[block_idx] = {'video': (B, Lv, C), 'action': (B, La, C)}``
+        # The slices follow the same split_list as forward_train so the call
+        # sites do not need to know about padding.
+        xstream_layers = input_dict.get('xstream_layers', None)
+        xstream_set = set()
+        if xstream_layers is not None:
+            xstream_set = {int(i) for i in xstream_layers}
+        captured_xstream = {}
+
+        def _maybe_capture_xstream(block_idx, h):
+            if block_idx not in xstream_set:
+                return
+            n_video = split_list[0]
+            action_start = split_list[0] + split_list[1]
+            n_action = split_list[2]
+            video_tokens = h[:, :n_video]
+            action_tokens = h[:, action_start:action_start + n_action]
+            captured_xstream[block_idx] = {
+                'video': rearrange(
+                    video_tokens, '1 (b l) c -> b l c', b=batch_size
+                ),
+                'action': rearrange(
+                    action_tokens, '1 (b l) c -> b l c', b=batch_size
+                ),
+            }
+
         # ---- Cross-attention probability capture (visualization) ----
         capture_cross_attn = bool(input_dict.get('capture_cross_attn', False))
         capture_layers = input_dict.get('capture_layers', None)
@@ -304,6 +334,7 @@ class WanTransformer3DModel(BaseWanTransformer3DModel):
                     )
                 else:
                     captured_hidden_states[block_idx] = hidden_states
+            _maybe_capture_xstream(block_idx, hidden_states)
 
         # Snapshot at the fork point so internal branch starts from same tensor.
         forked_hidden = hidden_states
@@ -330,6 +361,7 @@ class WanTransformer3DModel(BaseWanTransformer3DModel):
                     )
                 else:
                     captured_hidden_states[block_idx] = hidden_states
+            _maybe_capture_xstream(block_idx, hidden_states)
 
         # ---- Main head (D_f) ----
         main_sst = self.scale_shift_table[None] + temb[:, :, None, ...]
@@ -394,6 +426,8 @@ class WanTransformer3DModel(BaseWanTransformer3DModel):
             out['attn_probs'] = captured_attn_probs
             out['split_list'] = split_list
             out['batch_size'] = batch_size
+        if xstream_layers is not None:
+            out['xstream_hidden_states'] = captured_xstream
         return out
 
     def forward_train(self, input_dict):
@@ -404,11 +438,12 @@ class WanTransformer3DModel(BaseWanTransformer3DModel):
         """
         out = self.forward_train_gf_internal(input_dict)
         # Backward-compatible plain-tuple return when no extra hooks are on
-        # AND no internal head AND no attn capture (rare path).
+        # AND no internal head AND no attn capture AND no cross-stream capture.
         if (
             not self.enable_internal
             and out.get('align_hidden_states') is None
             and 'attn_probs' not in out
+            and 'xstream_hidden_states' not in out
         ):
             return out['pred']
         return out
