@@ -13,7 +13,7 @@ va_robotwin_train_vggt_repa_vae_cfg.update(va_robotwin_train_vggt_cfg)
 # Default output root; override with CLI --save-root or env-driven configs on DLC.
 va_robotwin_train_vggt_repa_vae_cfg.save_root = '/mnt/nas/qianbin/train_repa'
 va_robotwin_train_vggt_repa_vae_cfg.wandb_run_name = 'train_vggt_repa_vae'
-va_robotwin_train_vggt_repa_vae_cfg.save_interval = 10000
+va_robotwin_train_vggt_repa_vae_cfg.save_interval = 1000
 
 # Keep the existing VGGT geometric branch available; set mode='feature' and vggt_loss_weight=0
 # if you want behavior closest to the paper's pure denoising + REPA setup.

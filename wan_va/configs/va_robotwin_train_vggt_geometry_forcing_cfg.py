@@ -35,7 +35,7 @@ va_robotwin_train_vggt_geometry_forcing_cfg.update(va_robotwin_train_vggt_cfg)
 # ---- IO / logging --------------------------------------------------------
 va_robotwin_train_vggt_geometry_forcing_cfg.save_root = './train_out/vggt_geometry_forcing'
 va_robotwin_train_vggt_geometry_forcing_cfg.wandb_run_name = 'train_vggt_geometry_forcing'
-va_robotwin_train_vggt_geometry_forcing_cfg.save_interval = 10000
+va_robotwin_train_vggt_geometry_forcing_cfg.save_interval = 1000
 
 # ---- Geometry Forcing settings ------------------------------------------
 # 'pure'   : paper-faithful, only Angular + Scale losses.
